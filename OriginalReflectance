@@ -1,0 +1,59 @@
+// Define study area
+var StudyArea = ee.FeatureCollection("projects/gorenflolab-473715/assets/EasternArcFinalSHP");
+Map.centerObject(StudyArea, 8);
+
+// Define manual decades and search windows
+var manualDates = [
+  {name: '2020', start: '2020-02-15', end: '2020-05-15'}
+];
+
+// Load Landsat 8 Surface Reflectance (Tier 1)
+var landsat = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2");
+
+// Cloud mask using QA_PIXEL bits (mask clouds + shadows)
+function mask(image) {
+  var qaPixel = image.select('QA_PIXEL');
+  var cloud = qaPixel.bitwiseAnd(1 << 3).neq(0);
+  var cloudShadow = qaPixel.bitwiseAnd(1 << 4).neq(0);
+  var mask = cloud.or(cloudShadow).not();
+  return image.updateMask(mask).clip(StudyArea);
+}
+
+// Loop through each decade
+manualDates.forEach(function(entry) {
+  // Filter imagery by date + area
+  var collection = landsat
+    .filterDate(entry.start, entry.end)
+    .filterBounds(StudyArea);
+
+  // Sort the collection by cloud cover and take the clearest
+  var bestScenes = collection.sort('CLOUD_COVER');
+
+  // Print collection size for verification
+  print('Filtered images for ' + entry.name, bestScenes);
+  
+  // Apply cloud/shadow mask
+  var masked = bestScenes.map(mask);
+
+  // Create a mosaic to splice the images together
+  var mosaic = masked.median();
+  
+  // Scale surface reflectance values
+  var scaled = mosaic.multiply(0.0000275).add(-0.2);
+
+  // Add layers to map
+  Map.addLayer(
+    scaled,
+    {bands: ['SR_B4','SR_B3','SR_B2'], min: 0.0, max: 0.3},
+    entry.name + ' True Color (Least Cloudy)'
+  );
+  Map.addLayer(
+    scaled,
+    {bands: ['SR_B5','SR_B4','SR_B3'], min: 0.0, max: 0.3},
+    entry.name + ' False Color (Least Cloudy)'
+  );
+
+  // NDVI layer
+  var ndvi = scaled.normalizedDifference(['SR_B5','SR_B4']).rename('NDVI');
+  Map.addLayer(ndvi, {min:0, max:1, palette:['white','green']}, entry.name + ' NDVI');
+});
