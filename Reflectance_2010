@@ -1,0 +1,132 @@
+// Define study area
+var StudyArea = ee.FeatureCollection("projects/gorenflolab-473715/assets/EasternArcFinalSHP");
+Map.centerObject(StudyArea, 8);
+
+// Import manually drawn Natural Forest polygon
+var Natural_Forest = ee.FeatureCollection('projects/gorenflolab-473715/assets/Natural_Forest')
+  .map(function(feature) {
+    return feature.set('lc', 11);
+  });
+
+// Define date window
+var manualDates = [
+  {name: '2010', start: '2010-02-15', end: '2010-05-15'}
+];
+
+// Load Landsat 7 Surface Reflectance Collection
+var landsat = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2");
+
+// Cloud and shadow mask function
+function maskL7sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloud = qa.bitwiseAnd(1 << 3).neq(0);
+  var shadow = qa.bitwiseAnd(1 << 4).neq(0);
+  var mask = cloud.or(shadow).not();
+  return image.updateMask(mask);
+}
+
+// Filter and process imagery
+var entry = manualDates[0];
+var collection = landsat
+  .filterDate(entry.start, entry.end)
+  .filterBounds(StudyArea)
+  .map(maskL7sr);
+
+// Median composite and scale reflectance
+var mosaic = collection.median()
+  .multiply(0.0000275)
+  .add(-0.2)
+  .clip(StudyArea);
+
+// Spectral indices for Landat 7
+var ndvi = mosaic.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'); // NIR/Red
+var ndwi = mosaic.normalizedDifference(['SR_B2', 'SR_B5']).rename('NDWI'); // Green/NIR
+var nbr  = mosaic.normalizedDifference(['SR_B5', 'SR_B7']).rename('NBR');  // NIR/SWIR2
+
+// Combine all into one image
+var img = mosaic.addBands([ndvi, ndwi, nbr]);
+
+// ESA WorldCover
+var lc = ee.Image('ESA/WorldCover/v100/2020').clip(StudyArea);
+
+// Original ESA class codes
+var classValues = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100];
+var remapValues = ee.List.sequence(0, 10);
+lc = lc.remap(classValues, remapValues).rename('lc').toByte();
+
+// ESA-based stratified sampling
+var esaSamples = img.addBands(lc).stratifiedSample({
+  numPoints: 200,
+  classBand: 'lc',
+  region: StudyArea,
+  scale: 30,
+  geometries: true
+});
+
+// Natural Forest polygon samples
+var naturalForestSamples = img.sampleRegions({
+  collection: Natural_Forest,
+  properties: ['lc'], // lc = 11
+  scale: 30,
+  geometries: true
+});
+
+// Merge both sets
+var sample = esaSamples.merge(naturalForestSamples);
+
+// Split training/validation
+sample = sample.randomColumn('random');
+var training = sample.filter('random <= 0.8');
+var validation = sample.filter('random > 0.8');
+
+// RFM
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 100,
+  variablesPerSplit: null,
+  minLeafPopulation: 1
+}).train({
+  features: training,
+  classProperty: 'lc',
+  inputProperties: img.bandNames()
+});
+
+// Accuracy assessment
+var trainAccuracy = classifier.confusionMatrix();
+print('Training Error Matrix:', trainAccuracy);
+print('Training Accuracy:', trainAccuracy.accuracy());
+
+// Apply classifier to image
+var classified = img.classify(classifier);
+
+// Validation
+var validated = validation.classify(classifier);
+var valErrorMatrix = validated.errorMatrix('lc', 'classification');
+print('Validation Error Matrix:', valErrorMatrix);
+print('Validation Accuracy:', valErrorMatrix.accuracy());
+
+// Add the new Natural_Forest class (11)
+var classVis = {
+  min: 0,
+  max: 11,
+  palette: [
+    '006400', // Tree cover
+    'ffbb22', // Shrubland
+    'ffff4c', // Grassland
+    'f096ff', // Cropland
+    'fa0000', // Built-up
+    'b4b4b4', // Bare
+    'f0f0f0', // Snow & Ice
+    '0064c8', // Water
+    '0096a0', // Herbaceous wetland
+    '00cf75', // Mangrove
+    'fae6a0', // Moss & lichen
+    '00ff00'  // Natural Forest
+  ]
+};
+
+// Map display
+Map.addLayer(img, {bands: ['SR_B3', 'SR_B2', 'SR_B1'], min: 0, max: 0.3}, 'True Color');
+Map.addLayer(classified, classVis, 'Random Forest Classification');
+Map.addLayer(Natural_Forest, {color: '00ff00'}, 'Natural Forest Polygon', false);
+Map.addLayer(training, {color: 'white'}, 'Training Samples', false);
+Map.addLayer(validation, {color: 'black'}, 'Validation Samples', false);
