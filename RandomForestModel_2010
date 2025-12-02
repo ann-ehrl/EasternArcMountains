@@ -10,11 +10,11 @@ var Natural_Forest = ee.FeatureCollection('projects/gorenflolab-473715/assets/Na
 
 // Define date window
 var manualDates = [
-  {name: '2010', start: '2010-02-15', end: '2010-05-15'}
+  {name: '2010', start: '2010-01-15', end: '2010-07-15'}
 ];
 
-// Load Landsat 7 Surface Reflectance Collection
-var landsat = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2");
+// Load Landsat 5 Surface Reflectance Collection (NOT 7 because of gaps and no cloud fill in GEE)
+var landsat = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
 
 // Cloud and shadow mask function
 function maskL7sr(image) {
@@ -38,7 +38,7 @@ var mosaic = collection.median()
   .add(-0.2)
   .clip(StudyArea);
 
-// Spectral indices for Landat 7
+// Spectral indices for Landat 5
 var ndvi = mosaic.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'); // NIR/Red
 var ndwi = mosaic.normalizedDifference(['SR_B2', 'SR_B5']).rename('NDWI'); // Green/NIR
 var nbr  = mosaic.normalizedDifference(['SR_B5', 'SR_B7']).rename('NBR');  // NIR/SWIR2
