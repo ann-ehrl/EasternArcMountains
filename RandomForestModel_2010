@@ -10,14 +10,14 @@ var Natural_Forest = ee.FeatureCollection('projects/gorenflolab-473715/assets/Na
 
 // Define date window
 var manualDates = [
-  {name: '2000', start: '2000-02-15', end: '2000-05-15'}
+  {name: '2010', start: '2010-01-15', end: '2010-07-15'}
 ];
 
-// Load Landsat 7 Surface Reflectance Collection
-var landsat = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2");
+// Load Landsat 5 Surface Reflectance Collection (NOT 7 because of gaps and no cloud fill in GEE)
+var landsat = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
 
 // Cloud and shadow mask function
-function maskL7sr(image) {
+function maskL5sr(image) {
   var qa = image.select('QA_PIXEL');
   var cloud = qa.bitwiseAnd(1 << 3).neq(0);
   var shadow = qa.bitwiseAnd(1 << 4).neq(0);
@@ -30,7 +30,7 @@ var entry = manualDates[0];
 var collection = landsat
   .filterDate(entry.start, entry.end)
   .filterBounds(StudyArea)
-  .map(maskL7sr);
+  .map(maskL5sr);
 
 // Median composite and scale reflectance
 var mosaic = collection.median()
@@ -38,7 +38,7 @@ var mosaic = collection.median()
   .add(-0.2)
   .clip(StudyArea);
 
-// Spectral indices for Landat 7
+// Spectral indices for Landat 5
 var ndvi = mosaic.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI'); // NIR/Red
 var ndwi = mosaic.normalizedDifference(['SR_B2', 'SR_B5']).rename('NDWI'); // Green/NIR
 var nbr  = mosaic.normalizedDifference(['SR_B5', 'SR_B7']).rename('NBR');  // NIR/SWIR2
@@ -134,8 +134,8 @@ Map.addLayer(validation, {color: 'black'}, 'Validation Samples', false);
 // Compress and save as .GeoTIFF
 Export.image.toDrive({
   image: classified.toByte(),
-  description: 'L7_RF_Classification_2000_EasternArc',
-  fileNamePrefix: 'L7_RF_Classification_2000',
+  description: 'L5_RF_Classification_2010_EasternArc',
+  fileNamePrefix: 'L5_RF_Classification_2010',
   scale: 30,
   region: StudyArea.geometry(),
   fileFormat: 'GeoTIFF',
