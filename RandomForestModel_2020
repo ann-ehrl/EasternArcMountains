@@ -137,3 +137,21 @@ Export.table.toAsset({
   description: 'Export_Natural_Forest',
   assetId: 'Natural_Forest'
 });
+
+// Map display
+Map.addLayer(img, {bands: ['SR_B3', 'SR_B2', 'SR_B1'], min: 0, max: 0.3}, 'True Color');
+Map.addLayer(classified, classVis, 'Random Forest Classification');
+Map.addLayer(Natural_Forest, {color: '00ff00'}, 'Natural Forest Polygon', false);
+Map.addLayer(training, {color: 'white'}, 'Training Samples', false);
+Map.addLayer(validation, {color: 'black'}, 'Validation Samples', false);
+
+// Compress and save as .GeoTIFF
+Export.image.toDrive({
+  image: classified.toByte(),
+  description: 'L8_RF_Classification_2020_EasternArc',
+  fileNamePrefix: 'L8_RF_Classification_2020',
+  scale: 30,
+  region: StudyArea.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
