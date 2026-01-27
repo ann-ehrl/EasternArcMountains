@@ -130,3 +130,14 @@ Map.addLayer(classified, classVis, 'Random Forest Classification');
 Map.addLayer(Natural_Forest, {color: '00ff00'}, 'Natural Forest Polygon', false);
 Map.addLayer(training, {color: 'white'}, 'Training Samples', false);
 Map.addLayer(validation, {color: 'black'}, 'Validation Samples', false);
+
+// Compress and save as .GeoTIFF
+Export.image.toDrive({
+  image: classified.toByte(),
+  description: 'L7_RF_Classification_2000_EasternArc',
+  fileNamePrefix: 'L7_RF_Classification_2000',
+  scale: 30,
+  region: StudyArea.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
