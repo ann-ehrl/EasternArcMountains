@@ -1,0 +1,465 @@
+var StudyArea = ee.FeatureCollection("projects/gorenflolab-473715/assets/EasternArcFinalSHP");
+Map.centerObject(StudyArea, 8);
+
+// Landsat 5/7 composite
+var l5 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
+var l7 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2");
+
+function maskLandsatSR(image) {
+  var qa = image.select('QA_PIXEL');
+  return image.updateMask(
+    qa.bitwiseAnd(1 << 3).neq(0).or(qa.bitwiseAnd(1 << 4).neq(0)).not()
+  );
+}
+
+// Standardize band naming conventions
+function renameL5(img) {
+  return img.select(
+    ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'],
+    ['Blue','Green','Red','NIR','SWIR1','SWIR2']
+  );
+}
+
+// Standardize band naming conventions
+function renameL7(img) {
+  return img.select(
+    ['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7'],
+    ['Blue','Green','Red','NIR','SWIR1','SWIR2']
+  );
+}
+
+// Merged mosaic for 2000 imagery
+var mosaic = l5
+  .filterDate('2000-01-15', '2000-12-15')
+  .filterBounds(StudyArea)
+  .filter(ee.Filter.lt('CLOUD_COVER', 40))
+  .map(maskLandsatSR)
+  .map(renameL5)
+  .limit(60)
+  .merge(
+    l7.filterDate('2000-01-15', '2000-12-15')
+      .filterBounds(StudyArea)
+      .filter(ee.Filter.lt('CLOUD_COVER', 40))
+      .map(maskLandsatSR)
+      .map(renameL7)
+      .limit(60)
+  )
+  .median()
+  .multiply(0.0000275)
+  .add(-0.2)
+  .clip(StudyArea);
+
+// Spectral indices
+var ndvi = mosaic.normalizedDifference(['NIR','Red']).rename('NDVI');
+var ndwi = mosaic.normalizedDifference(['Green','NIR']).rename('NDWI');
+var mndwi = mosaic.normalizedDifference(['Green', 'SWIR1']).rename('MNDWI');
+var ndbi = mosaic.normalizedDifference(['SWIR1','NIR']).rename('NDBI');
+var savi = mosaic.expression(
+  '1.5 * (NIR - Red) / (NIR + Red + 0.5)',
+  { NIR: mosaic.select('NIR'), Red: mosaic.select('Red') }
+).rename('SAVI');
+
+// GLCM Texture
+// Natural Forest (uniform) vs. degraded Tree Cover and Shrubland (heterogeneous)
+var glcm = mosaic.select('NIR')
+  .max(0)
+  .unitScale(0, 0.5)
+  .multiply(255)
+  .toByte()
+  .glcmTexture({ size: 3 })
+  .select('NIR_asm')
+  .rename('Texture');
+
+// Combined image
+var img = ee.Image.cat([
+  mosaic.select(['Blue','Green','Red','NIR','SWIR1','SWIR2']),
+  ndvi,
+  ndwi,
+  ndbi,
+  mndwi,
+  savi,
+  glcm
+]);
+
+// ESA Worldcover 2020 remapped for 2000 with FAO
+//  0 = Natural Forest  
+//  1 = Shrubland       
+//  2 = Grassland        
+//  3 = Cropland      
+//  4 = Built-up        
+//  5 = Bare             
+//  7 = Water            
+// 11 = Tree Cover        
+
+var esaRaw = ee.Image('ESA/WorldCover/v100/2020')
+  .select('Map')
+  .clip(StudyArea);
+
+var esaRemapped = esaRaw.remap(
+  [10,  20,  30,  40,  50,  60,  80],
+  [ 0,   1,   2,   3,   4,   5,   7]
+).rename('lc').toByte();
+
+// Spectral consistency filter
+// Removes ESA 2020 pixels with different spectral signatures
+var shrubMask   = esaRemapped.eq(1)
+  .and(ndvi.gt(0.2))
+  .and(ndvi.lt(0.5))
+  .and(mosaic.select('SWIR2').gt(0.15));  // woody biomass signal
+
+var grassMask   = esaRemapped.eq(2)
+  .and(ndvi.gt(0.05))
+  .and(ndvi.lt(0.4))
+  .and(mosaic.select('SWIR2').lt(0.18));  // herbaceous, less woody
+
+var bareMask    = esaRemapped.eq(5)
+  .and(ndvi.lt(0.10))
+  .and(ndwi.lt(-0.1));
+
+var waterMask = esaRemapped.eq(7)
+  .and(ndwi.gt(0.25))
+  .and(mosaic.select('NIR').lt(0.10))
+  .and(mosaic.select('SWIR1').lt(0.08));  
+
+var consistencyMask = shrubMask
+  .or(grassMask)
+  .or(bareMask)
+  .or(waterMask);
+
+var esaFiltered = esaRemapped.updateMask(consistencyMask);
+
+// ESA stratified sampling
+var esaSamples = img.addBands(esaFiltered).stratifiedSample({
+  numPoints: 300,
+  classBand: 'lc',
+  region: StudyArea,
+  scale: 30,
+  seed: 42,
+  geometries: false
+});
+
+// Import polygon samples
+var Natural_Forest = ee.FeatureCollection('projects/gorenflolab-473715/assets/Natural_Forest')
+  .map(function(f) { return f.set('lc', 0); });
+
+var Built_Up = ee.FeatureCollection('projects/gorenflolab-473715/assets/Built_Up')
+  .map(function(f) { return f.set('lc', 4); });
+  
+var Water = ee.FeatureCollection('projects/gorenflolab-473715/assets/Water_Polygons')
+  .map(function(f) { return f.set('lc', 7); });
+  
+var Plantation = ee.FeatureCollection('projects/gorenflolab-473715/assets/Plantation')
+  .map(function(f) {return f.set('lc', 11); });
+
+var nfSamples = img.sampleRegions({
+  collection: Natural_Forest,
+  properties: ['lc'],
+  scale: 30,
+  geometries: false
+}).limit(300);
+
+var plantationSamples = img.sampleRegions({
+  collection: Plantation,
+  properties: ['lc'],
+  scale: 30,
+  geometries: false
+}).limit(300);
+
+var builtMask = ndbi.gt(0.05)
+  .and(ndvi.lt(0.3));
+
+var buSamples = img.updateMask(builtMask)
+  .sampleRegions({
+    collection: Built_Up,
+    properties: ['lc'],
+    scale: 30,
+    geometries: false
+  })
+  .limit(300);
+
+var waterSamples = img.sampleRegions({
+  collection: Water,
+  properties: ['lc'],
+  scale: 30,
+  geometries: false
+}).limit(75);
+
+// Merge samples
+var sample = esaSamples
+  .merge(nfSamples)
+  .merge(plantationSamples)
+  .merge(buSamples)
+  .merge(waterSamples)
+  .randomColumn('random', 42);
+
+var training   = sample.filter(ee.Filter.lte('random', 0.7));
+var validation = sample.filter(ee.Filter.gt('random', 0.7));
+
+// Fixing classes with fewer than 50 samples
+var allClasses = [0, 1, 2, 4, 5, 7, 11];
+allClasses.forEach(function(c) {
+  print('Class ' + c + ' training n:',
+    training.filter(ee.Filter.eq('lc', c)).size());
+});
+print('Total training n:', training.size());
+print('Total validation n:', validation.size());
+
+// Random forest classifier
+var classifier = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  minLeafPopulation: 5,
+  seed: 42
+}).train({
+  features: training,
+  classProperty: 'lc',
+  inputProperties: img.bandNames()
+});
+
+// Accuracy assessment
+var trainCM = classifier.confusionMatrix();
+print('Training confusion matrix:', trainCM);
+print('Training overall accuracy:', trainCM.accuracy());
+print('Training kappa:', trainCM.kappa());
+
+var classified = img.classify(classifier)
+    .setDefaultProjection(mosaic.projection());
+
+var valCM = validation.classify(classifier).errorMatrix('lc', 'classification');
+print('Validation confusion matrix:', valCM);
+print('Validation overall accuracy:', valCM.accuracy());
+print('Validation kappa:', valCM.kappa());
+
+// Checking texture ranks
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+print('Band importance:', importance);
+
+// Display remap for new classes
+var classifiedVis = classified.remap(
+  [0,  1,  2,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  7]
+);
+
+var classVis = {
+  min: 0,
+  max: 6,
+  palette: [
+    '005500',  // 0  Natural Forest
+    'ffbb22',  // 1  Shrubland
+    'ffff4c',  // 2  Grassland
+    'fa0000',  // 4  Built-up
+    'b4b4b4',  // 5  Bare
+    '0064c8',  // 7  Water
+    '00ff00'   // 11  Plantation Forest
+  ]
+};
+
+Map.addLayer(classifiedVis, classVis, 'RF Classification 2000 — 7 class');
+Map.addLayer(mosaic, { bands: ['NIR','Red','Green'], min: 0, max: 0.3 },
+  'Landsat 2000 false colour', false);
+Map.addLayer(esaFiltered,
+  { min: 0, max: 11, palette: [
+    '006400','ffbb22','ffff4c','f096ff',
+    'fa0000','b4b4b4','f0f0f0','0064c8',
+    '0096a0','00cf75','fae6a0','005500'
+  ]}, 'ESA filtered training labels', false);
+Map.addLayer(Natural_Forest, { color: '005500' }, 'Natural Forest polygons', false);
+Map.addLayer(Built_Up, { color: 'fa0000' }, 'Built-Up polygons', false);
+Map.addLayer(Water, { color: '0064c8' }, 'Water polygons', false);
+Map.addLayer(Plantation, {color: '00ff00'}, 'Plantation polygons', false);
+
+// Export, remapped to consistent 0-8 scheme 
+// 0=Tree Cover, 1=Shrubland, 2=Grassland, 3=Cropland,
+// 4=Built-up, 5=Bare, 6=Water, 7=Wetland, 8=Natural Forest
+var classifiedExport = classified.remap(
+  [0,  1,  2,  3,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  6,  7]
+).toByte()
+ .clip(StudyArea);
+Export.image.toDrive({
+  image: classifiedExport,
+  description: 'L57_RF_Classification_2000_EasternArc',
+  fileNamePrefix: 'L57_RF_Classification_2000',
+  scale: 30,
+  region: StudyArea.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// 2010 CLASSIFICATION -- reuses classifier trained on 2000 polygons
+
+var mosaic2010 = l5
+  .filterDate('2010-01-15', '2010-12-15')
+  .filterBounds(StudyArea)
+  .filter(ee.Filter.lt('CLOUD_COVER', 40))
+  .map(maskLandsatSR)
+  .map(renameL5)
+  .limit(60)
+  .merge(
+    l7.filterDate('2010-01-15', '2010-12-15')
+      .filterBounds(StudyArea)
+      .filter(ee.Filter.lt('CLOUD_COVER', 40))
+      .map(maskLandsatSR)
+      .map(renameL7)
+      .limit(60)
+  )
+  .median()
+  .multiply(0.0000275)
+  .add(-0.2)
+  .clip(StudyArea);
+
+var ndvi2010  = mosaic2010.normalizedDifference(['NIR','Red']).rename('NDVI');
+var ndwi2010  = mosaic2010.normalizedDifference(['Green','NIR']).rename('NDWI');
+var mndwi2010 = mosaic2010.normalizedDifference(['Green','SWIR1']).rename('MNDWI');
+var ndbi2010  = mosaic2010.normalizedDifference(['SWIR1','NIR']).rename('NDBI');
+var savi2010  = mosaic2010.expression(
+  '1.5 * (NIR - Red) / (NIR + Red + 0.5)',
+  { NIR: mosaic2010.select('NIR'), Red: mosaic2010.select('Red') }
+).rename('SAVI');
+
+var glcm2010 = mosaic2010.select('NIR')
+  .max(0)
+  .unitScale(0, 0.5)
+  .multiply(255)
+  .toByte()
+  .glcmTexture({ size: 3 })
+  .select('NIR_asm')
+  .rename('Texture');
+
+// Must match img.bandNames() exactly as 2000
+var img2010 = ee.Image.cat([
+  mosaic2010.select(['Blue','Green','Red','NIR','SWIR1','SWIR2']),
+  ndvi2010,
+  ndwi2010,
+  ndbi2010,
+  mndwi2010,
+  savi2010,
+  glcm2010
+]);
+
+// Classify with the same classifier trained on 2000 polygons
+var classified2010 = img2010.classify(classifier);
+
+// Confirm band names line up before classifying
+print('2010 image bands match training bands:',
+  ee.List(img2010.bandNames()).sort().equals(ee.List(img.bandNames()).sort()));
+
+// Display
+var classifiedVis2010 = classified2010.remap(
+  [0,  1,  2,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  7]
+);
+
+Map.addLayer(classifiedVis2010, classVis, 'RF Classification 2010 — 7 class (same model)');
+Map.addLayer(mosaic2010, { bands: ['NIR','Red','Green'], min: 0, max: 0.3 },
+  'Landsat 2010 false colour', false);
+
+// Export with same scheme as 2000
+var classifiedExport2010 = classified2010.remap(
+  [0,  1,  2,  3,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  6,  7]
+).toByte()
+ .clip(StudyArea);
+
+Export.image.toDrive({
+  image: classifiedExport2010,
+  description: 'L57_RF_Classification_2010_EasternArc',
+  fileNamePrefix: 'L57_RF_Classification_2010',
+  scale: 30,
+  region: StudyArea.geometry(),
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// 2020 CLASSIFICATION -- trained on 2000 thresholds
+
+// Landsat 8 imagery
+var l8 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2");
+
+// L8 cloud/shadow bits are identical to L5/L7, so maskLandsatSR
+function renameL8(img) {
+  return img.select(
+    ['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'],
+    ['Blue','Green','Red','NIR','SWIR1','SWIR2']
+  );
+}
+
+// Optimized mosaic for 2020 imagery
+var mosaic2020 = l8
+  .filterDate('2020-01-15', '2020-12-15')
+  .filterBounds(StudyArea)
+  .filter(ee.Filter.lt('CLOUD_COVER', 40))
+  .map(maskLandsatSR)
+  .map(renameL8)
+  .median()
+  .multiply(0.0000275)
+  .add(-0.2)
+  .clip(StudyArea);
+
+var ndvi2020  = mosaic2020.normalizedDifference(['NIR','Red']).rename('NDVI');
+var ndwi2020  = mosaic2020.normalizedDifference(['Green','NIR']).rename('NDWI');
+var mndwi2020 = mosaic2020.normalizedDifference(['Green','SWIR1']).rename('MNDWI');
+var ndbi2020  = mosaic2020.normalizedDifference(['SWIR1','NIR']).rename('NDBI');
+var savi2020  = mosaic2020.expression(
+  '1.5 * (NIR - Red) / (NIR + Red + 0.5)',
+  { NIR: mosaic2020.select('NIR'), Red: mosaic2020.select('Red') }
+).rename('SAVI');
+
+var glcm2020 = mosaic2020.select('NIR')
+  .max(0)
+  .unitScale(0, 0.5)
+  .multiply(255)
+  .toByte()
+  .glcmTexture({ size: 3 })
+  .select('NIR_asm')
+  .rename('Texture');
+
+// Must match img.bandNames() exactly as 2000/2010
+var img2020 = ee.Image.cat([
+  mosaic2020.select(['Blue','Green','Red','NIR','SWIR1','SWIR2']),
+  ndvi2020,
+  ndwi2020,
+  ndbi2020,
+  mndwi2020,
+  savi2020,
+  glcm2020
+]);
+
+// Classify with the  lassifier trained on 2000 polygons
+var classified2020 = img2020.classify(classifier);
+
+// Confirm band names line up before classifying/exporting
+print('2020 image bands match training bands:',
+  ee.List(img2020.bandNames()).sort().equals(ee.List(img.bandNames()).sort()));
+
+// Display
+var classifiedVis2020 = classified2020.remap(
+  [0,  1,  2,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  7]
+);
+
+Map.addLayer(classifiedVis2020, classVis, 'RF Classification 2020 — 7 class (same model)');
+Map.addLayer(mosaic2020, { bands: ['NIR','Red','Green'], min: 0, max: 0.3 },
+  'Landsat 2020 false colour', false);
+
+// Build an explicit mask from StudyArea
+var studyMask = ee.Image.constant(1).clip(StudyArea).mask();
+
+var classifiedExport2020 = classified2020.remap(
+  [0,  1,  2,  3,  4,  5,  7,  11],
+  [0,  1,  2,  3,  4,  5,  6,  7]
+).toByte()
+ .clip(StudyArea);   
+
+var exportRegion = StudyArea.geometry().dissolve();
+
+Export.image.toDrive({
+  image: classifiedExport,
+  description: 'L8_RF_Classification_2020',
+  region: exportRegion,
+  scale: 30,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+print(buSamples.size());
