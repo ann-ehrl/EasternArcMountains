@@ -1,0 +1,64 @@
+// Define study area
+var StudyArea = ee.FeatureCollection("projects/gorenflolab-473715/assets/EasternArcFinalSHP");
+Map.centerObject(StudyArea, 8);
+
+// Define date range
+var manualDates = [
+  {name: '2010-2011', start: '2010-01-15', end: '2011-12-15'}
+];
+
+// Load Landsat 5 Surface Reflectance
+var landsat = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2");
+
+// Cloud + shadow mask
+function mask(image) {
+  var qaPixel = image.select('QA_PIXEL');
+  var cloud = qaPixel.bitwiseAnd(1 << 3).neq(0);
+  var cloudShadow = qaPixel.bitwiseAnd(1 << 4).neq(0);
+  var mask = cloud.or(cloudShadow).not();
+  return image.updateMask(mask).clip(StudyArea);
+}
+
+// Loop
+manualDates.forEach(function(entry) {
+
+  var collection = landsat
+    .filterDate(entry.start, entry.end)
+    .filterBounds(StudyArea)
+    .sort('CLOUD_COVER');
+
+  print('Filtered images for ' + entry.name, collection);
+
+  var masked = collection.map(mask);
+
+  // Median composite
+  var mosaic = masked.median();
+
+  // Apply scale factor
+  var scaled = mosaic.multiply(0.0000275).add(-0.2);
+
+  // TRUE COLOR (B3, B2, B1)
+  Map.addLayer(
+    scaled,
+    {bands: ['SR_B3','SR_B2','SR_B1'], min: 0.0, max: 0.3},
+    entry.name + ' True Color'
+  );
+
+  // FALSE COLOR (B4, B3, B2)
+  Map.addLayer(
+    scaled,
+    {bands: ['SR_B4','SR_B3','SR_B2'], min: 0.0, max: 0.3},
+    entry.name + ' False Color'
+  );
+
+  // NDVI
+  var ndvi = scaled
+    .normalizedDifference(['SR_B4','SR_B3'])
+    .rename('NDVI');
+
+  Map.addLayer(
+    ndvi,
+    {min: 0, max: 1, palette: ['white','green']},
+    entry.name + ' NDVI'
+  );
+});
